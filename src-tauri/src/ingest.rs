@@ -304,26 +304,78 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+fn stem_of(path: &Path) -> String {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// `file`'s name with `suffix` added to the stem it shares with its photo:
+/// `DSC1.ARW` → `DSC1_1.ARW`, `DSC1.ARW.xmp` → `DSC1_1.ARW.xmp`.
+fn renamed(file: &Path, stem: &str, suffix: &str) -> String {
+    let name = file_name(file);
+    match name.strip_prefix(stem) {
+        Some(rest) => format!("{stem}{suffix}{rest}"),
+        // A JPEG named differently from its RAW keeps its own stem.
+        None => match name.rsplit_once('.') {
+            Some((own, ext)) => format!("{own}{suffix}.{ext}"),
+            None => format!("{name}{suffix}"),
+        },
+    }
+}
+
+/// The sidecars on the card that go with a photo, under either naming.
+fn sidecars_of(photo: &Path) -> Vec<PathBuf> {
+    let mut with_ext = photo.as_os_str().to_owned();
+    with_ext.push(".xmp");
+    let mut found: Vec<PathBuf> = [photo.with_extension("xmp"), PathBuf::from(with_ext)].into_iter().filter(|p| p.is_file()).collect();
+    found.dedup();
+    found
+}
+
+/// The files a photo brings: itself, its JPEG, and `sidecars`.
+fn files_of(item: &Item, sidecars: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = vec![item.path.clone()];
+    files.extend(item.companion().map(Path::to_path_buf));
+    files.extend(sidecars.iter().cloned());
+    files
+}
+
+/// The names a photo would be read through at the destination without
+/// bringing them: a sidecar already there under either naming would be
+/// taken for its own.
+fn sidecar_names(stem: &str, item: &Item) -> [String; 2] {
+    [format!("{stem}.xmp"), format!("{}.xmp", file_name(&item.path))]
+}
+
 /// How many of these photos want a name that is already taken.
 ///
 /// Two ways to collide, not one. The obvious way is a file already in the
-/// destination. The other is the selection colliding with itself: a camera
-/// restarts numbering in every card folder, so a card carrying three shoots
-/// holds the same file name three times over. Miss that, and a whole card
-/// copied into an empty folder counts no conflicts, never asks, and quietly
-/// loses a photograph for every repeat.
+/// destination: the photo, its JPEG or a sidecar. The other is the selection
+/// colliding with itself: a camera restarts numbering in every card folder,
+/// so a card carrying three shoots holds the same file name three times
+/// over. Whatever is chosen for the first kind, the second kind is always
+/// copied side by side, `NAME` and `NAME_1`.
 pub fn conflict_count(items: &[Item], destination: &Path) -> usize {
     let mut claimed = HashSet::new();
     items
         .iter()
         .filter(|item| {
-            let name = file_name(&item.path);
+            let stem = stem_of(&item.path);
             // Lowercased: the destination very likely ignores case, so
             // `IMG_1.ARW` and `img_1.arw` are one file there.
-            let repeat = !claimed.insert(name.to_lowercase());
-            repeat || destination.join(&name).exists()
+            let repeat = !claimed.insert(file_name(&item.path).to_lowercase());
+            repeat || files_of(item, &sidecars_of(&item.path)).iter().map(|f| file_name(f)).chain(sidecar_names(&stem, item)).any(|n| destination.join(n).exists())
         })
         .count()
+}
+
+/// Where one photo is to go.
+#[derive(Debug, PartialEq)]
+enum Reserved {
+    /// Under this suffix to its stem ("" for its own name).
+    Fresh(String),
+    /// Under its own name, over what was already there, as was asked for.
+    Overwrite,
+    Skip,
 }
 
 /// Hands out destination names so two copies running at once can never
@@ -332,6 +384,12 @@ pub fn conflict_count(items: &[Item], destination: &Path) -> usize {
 /// Asking the disk whether a name is free is not enough: with four copies
 /// going, two can be told the same name is free before either has written a
 /// byte, and the loser's photo is then overwritten by the winner's.
+///
+/// What this run has claimed also tells what was at the destination before
+/// it began: a file there that this run did not claim. The choice of Skip,
+/// Overwrite or a unique name applies only to those. Two photos of this run
+/// that want one name never skip or overwrite each other; the second always
+/// takes `NAME_1`.
 #[derive(Default)]
 struct Names {
     claimed: Mutex<HashSet<String>>,
@@ -342,22 +400,61 @@ impl Names {
         path.to_string_lossy().to_lowercase()
     }
 
-    /// Claims `preferred` if it is free, otherwise the first of `name_1`,
-    /// `name_2`… that is. Free means not on disk and not already handed out.
-    fn unique(&self, preferred: &Path) -> Option<PathBuf> {
-        let mut claimed = self.claimed.lock().unwrap();
-        let mut free = |candidate: &Path| !candidate.exists() && claimed.insert(Self::key(candidate));
-        if free(preferred) {
-            return Some(preferred.to_path_buf());
-        }
-        let stem = preferred.file_stem()?.to_string_lossy().into_owned();
-        let ext = preferred.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-        (1..=10_000).map(|n| preferred.with_file_name(format!("{stem}_{n}{ext}"))).find(|c| free(c))
-    }
+    /// Finds one name for a photo, its JPEG and its sidecars together, and
+    /// claims it. A RAW and its JPEG always keep one stem: renamed apart, the
+    /// RAW would be paired with a stranger's JPEG.
+    fn reserve(&self, item: &Item, sidecars: &[PathBuf], destination: &Path, policy: Policy) -> Option<Reserved> {
+        let stem = stem_of(&item.path);
+        let files = files_of(item, sidecars);
+        // The names it takes, and those it must not land beside: a sidecar
+        // already there under either naming would be read as its own.
+        let names = |suffix: &str| -> (Vec<PathBuf>, Vec<PathBuf>) {
+            let brought: Vec<PathBuf> = files.iter().map(|f| destination.join(renamed(f, &stem, suffix))).collect();
+            let mut guarded = brought.clone();
+            for n in sidecar_names(&format!("{stem}{suffix}"), item) {
+                let p = destination.join(n);
+                if !guarded.contains(&p) {
+                    guarded.push(p);
+                }
+            }
+            (brought, guarded)
+        };
 
-    /// Claims an exact path, for when the name is not open to change.
-    fn claim(&self, path: &Path) {
-        self.claimed.lock().unwrap().insert(Self::key(path));
+        let mut claimed = self.claimed.lock().unwrap();
+        let ours = |claimed: &HashSet<String>, p: &Path| claimed.contains(&Self::key(p));
+        let try_suffix = |suffix: &str, claimed: &mut HashSet<String>| -> (bool, bool) {
+            let (brought, guarded) = names(suffix);
+            let in_run = brought.iter().any(|p| ours(claimed, p));
+            let already_there = !in_run && guarded.iter().any(|p| !ours(claimed, p) && p.exists());
+            if !in_run && !already_there {
+                for p in &brought {
+                    claimed.insert(Self::key(p));
+                }
+            }
+            (in_run, already_there)
+        };
+
+        match try_suffix("", &mut claimed) {
+            (false, false) => return Some(Reserved::Fresh(String::new())),
+            (false, true) => match policy {
+                Policy::Skip => return Some(Reserved::Skip),
+                Policy::Overwrite => {
+                    for p in names("").0 {
+                        claimed.insert(Self::key(&p));
+                    }
+                    return Some(Reserved::Overwrite);
+                }
+                Policy::UniqueName => {}
+            },
+            (true, _) => {}
+        }
+        for n in 1..=10_000 {
+            let suffix = format!("_{n}");
+            if try_suffix(&suffix, &mut claimed) == (false, false) {
+                return Some(Reserved::Fresh(suffix));
+            }
+        }
+        None
     }
 }
 
@@ -431,73 +528,54 @@ enum Placed {
 /// Puts one photo into the destination: itself, its JPEG, its ratings.
 fn place(item: &Item, destination: &Path, policy: Policy, names: &Names, on_bytes: &mut dyn FnMut(u64)) -> Placed {
     let name = file_name(&item.path);
-    let preferred = destination.join(&name);
-    let exists = preferred.exists();
-
-    let target = match (exists, policy) {
-        (true, Policy::Skip) => return Placed::Skipped,
-        (true, Policy::Overwrite) => {
-            names.claim(&preferred);
-            preferred
-        }
-        // Free on disk is not free: another copy running right now may be
-        // about to write the same name — two folders of one card both hold
-        // DSC00196. Reserving turns that race into an ordinary rename.
-        _ => match names.unique(&preferred) {
-            Some(target) => target,
-            None => return Placed::Failed(format!("{name}: could not find a free name")),
-        },
+    let stem = stem_of(&item.path);
+    let sidecars = sidecars_of(&item.path);
+    let (suffix, overwrite) = match names.reserve(item, &sidecars, destination, policy) {
+        Some(Reserved::Skip) => return Placed::Skipped,
+        Some(Reserved::Overwrite) => (String::new(), true),
+        Some(Reserved::Fresh(suffix)) => (suffix, false),
+        None => return Placed::Failed(format!("{name}: could not find a free name")),
     };
+    let to = |file: &Path| destination.join(renamed(file, &stem, &suffix));
     let failed = |e: io::Error| Placed::Failed(format!("Failed to copy {name}: {e}"));
 
-    if let Err(e) = verified_copy(&item.path, &target, exists && policy == Policy::Overwrite, on_bytes) {
+    let target = to(&item.path);
+    if let Err(e) = verified_copy(&item.path, &target, overwrite, on_bytes) {
         return failed(e);
     }
-
     // Its JPEG takes the name its RAW landed under.
     if let Some(jpeg) = item.companion() {
-        let beside = target.with_extension(jpeg.extension().unwrap_or_default());
-        let copied = match (beside.exists(), policy) {
-            (true, Policy::Skip) => Ok(()),
-            (true, Policy::Overwrite) => verified_copy(jpeg, &beside, true, on_bytes),
-            // Only overwriting is ever allowed to remove anything.
-            _ => match names.unique(&beside) {
-                Some(spot) => verified_copy(jpeg, &spot, false, on_bytes),
-                None => return Placed::Failed(format!("{name}: no free name for its JPEG")),
-            },
-        };
-        if let Err(e) = copied {
+        if let Err(e) = verified_copy(jpeg, &to(jpeg), overwrite, on_bytes) {
             return failed(e);
         }
     }
 
-    // A sidecar beside the source travels too. Not counted in the progress:
-    // a few hundred bytes against a RAW's tens of millions.
-    let sidecar = xmp::sidecar_path(&item.path);
-    if sidecar.is_file() {
-        let beside = xmp::sidecar_path(&target);
-        let mut quiet = |_: u64| {};
-        match (beside.exists(), policy) {
-            (true, Policy::Skip) => {}
-            (true, Policy::Overwrite) => {
-                verified_copy(&sidecar, &beside, true, &mut quiet).ok();
-            }
-            _ => {
-                if let Some(spot) = names.unique(&beside) {
-                    verified_copy(&sidecar, &spot, false, &mut quiet).ok();
-                }
-            }
+    // Its sidecars travel too, not counted in the progress: a few hundred
+    // bytes against a RAW's tens of millions. One already at the destination
+    // is never replaced, even when overwriting, since it may hold develop
+    // settings: the ratings in it are brought up to date below instead.
+    let mut carried = false;
+    for sidecar in &sidecars {
+        let beside = to(sidecar);
+        if !beside.exists() && verified_copy(sidecar, &beside, false, &mut |_| {}).is_ok() {
+            carried = true;
         }
     }
 
-    // Stars given in the camera are carried into a sidecar — but only when
-    // there are some. A sidecar that says nothing is not harmless: a reader
-    // stops at a sidecar, so an empty one overrides the rating inside the
-    // file. Read from the copy just made, which is the same bytes and does
-    // not send the card looking for them again.
-    let marks = xmp::read(&item.path, raw::probe(&target).ok().as_ref());
-    if !marks.is_empty() {
-        xmp::write(&target, marks).ok();
+    // Stars given in the camera, or ratings for a sidecar already there when
+    // overwriting, are written beside the copy — but only when there are
+    // some. A sidecar that says nothing is not harmless: a reader stops at a
+    // sidecar, so an empty one overrides the rating inside the file. Read
+    // from the copy just made, which is the same bytes and does not send the
+    // card looking for them again.
+    if !carried {
+        let marks = xmp::read(&item.path, raw::probe(&target).ok().as_ref());
+        // Not into a sidecar another photo of this run just put there: it is
+        // that photo's.
+        let theirs = !overwrite && xmp::sidecar_path(&target).exists();
+        if !marks.is_empty() && !theirs {
+            xmp::write(&target, marks).ok();
+        }
     }
     Placed::Copied
 }
@@ -819,6 +897,104 @@ mod tests {
         assert_eq!(outcome, Outcome::Success);
         assert_eq!(w.landed(), ["A.ARW"]);
         assert_eq!(w.read("A.ARW"), b"new");
+    }
+
+    #[test]
+    fn skip_existing_still_copies_a_repeat_name_from_another_card_folder() {
+        let w = World::new("skiprepeat");
+        let first = w.file("DCIM/100/DSC00001.ARW", b"first shoot");
+        let second = w.file("DCIM/101/DSC00001.ARW", b"second shoot");
+        let items = [alone(&first), alone(&second)];
+        assert_eq!(conflict_count(&items, &w.dest), 1, "the repeat is still asked about");
+
+        for workers in [1, 4] {
+            std::fs::remove_dir_all(&w.dest).unwrap();
+            std::fs::create_dir_all(&w.dest).unwrap();
+            let (outcome, _) = w.run(&items, Policy::Skip, workers);
+            assert_eq!(outcome, Outcome::Success);
+            assert_eq!(w.landed(), ["DSC00001.ARW", "DSC00001_1.ARW"], "with {workers} at once");
+        }
+    }
+
+    #[test]
+    fn overwriting_never_overwrites_a_photo_of_the_same_run() {
+        let w = World::new("overwriterepeat");
+        std::fs::write(w.dest.join("A.ARW"), b"old").unwrap();
+        let first = w.file("100/A.ARW", b"first");
+        let second = w.file("101/A.ARW", b"second");
+
+        let (outcome, _) = w.run(&[alone(&first), alone(&second)], Policy::Overwrite, 1);
+
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(w.read("A.ARW"), b"first", "what was there before is replaced, as asked");
+        assert_eq!(w.read("A_1.ARW"), b"second", "the repeat goes alongside, not over the first");
+    }
+
+    #[test]
+    fn a_raw_and_its_jpeg_keep_one_name_when_only_the_jpegs_is_taken() {
+        let w = World::new("pair");
+        std::fs::write(w.dest.join("A.JPG"), b"a stranger's jpeg").unwrap();
+        let raw = w.file("A.ARW", b"raw");
+        let jpg = w.file("A.JPG", b"mine");
+        let items = [Item { path: raw, display: jpg }];
+        assert_eq!(conflict_count(&items, &w.dest), 1, "a taken JPEG name is a conflict too");
+
+        let (outcome, _) = w.run(&items, Policy::UniqueName, 1);
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(w.landed(), ["A.JPG", "A_1.ARW", "A_1.JPG"]);
+
+        std::fs::remove_dir_all(&w.dest).unwrap();
+        std::fs::create_dir_all(&w.dest).unwrap();
+        std::fs::write(w.dest.join("A.JPG"), b"a stranger's jpeg").unwrap();
+        let (outcome, _) = w.run(&items, Policy::Skip, 1);
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(w.landed(), ["A.JPG"], "skipped whole, not a RAW without its JPEG");
+    }
+
+    #[test]
+    fn a_sidecar_already_at_the_destination_is_never_edited_when_skipping_or_renaming() {
+        let w = World::new("strangerxmp");
+        std::fs::write(w.dest.join("A.xmp"), b"another photo's edits").unwrap();
+        let raw = w.file("A.ARW", b"raw");
+        w.file("A.xmp", SIDECAR.as_bytes());
+
+        let (outcome, _) = w.run(&[alone(&raw)], Policy::Skip, 1);
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(w.landed(), ["A.xmp"]);
+
+        let (outcome, _) = w.run(&[alone(&raw)], Policy::UniqueName, 1);
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(w.read("A.xmp"), b"another photo's edits");
+        assert_eq!(w.landed(), ["A.xmp", "A_1.ARW", "A_1.xmp"]);
+        assert_eq!(xmp::read(&w.dest.join("A_1.ARW"), None).rating, 4, "its own ratings went with it");
+    }
+
+    #[test]
+    fn overwriting_keeps_the_edits_in_a_sidecar_and_changes_only_its_ratings() {
+        let w = World::new("overwritexmp");
+        std::fs::write(w.dest.join("A.ARW"), b"old").unwrap();
+        let edits = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" xmp:Rating="1" crs:Exposure2012="+0.35"/></rdf:RDF></x:xmpmeta>"#;
+        std::fs::write(w.dest.join("A.xmp"), edits).unwrap();
+        let raw = w.file("A.ARW", b"new");
+        w.file("A.xmp", SIDECAR.as_bytes());
+
+        let (outcome, _) = w.run(&[alone(&raw)], Policy::Overwrite, 1);
+
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(w.read("A.ARW"), b"new");
+        let text = String::from_utf8(w.read("A.xmp")).unwrap();
+        assert!(text.contains(r#"crs:Exposure2012="+0.35""#), "the develop settings stay: {text}");
+        assert_eq!(xmp::parse(&text).rating, 4, "the card's rating is brought across");
+    }
+
+    #[test]
+    fn both_namings_of_a_sidecar_travel() {
+        let w = World::new("bothxmp");
+        let raw = w.file("A.ARW", b"raw");
+        w.file("A.xmp", SIDECAR.as_bytes());
+        w.file("A.ARW.xmp", SIDECAR.as_bytes());
+        w.run(&[alone(&raw)], Policy::UniqueName, 1);
+        assert_eq!(w.landed(), ["A.ARW", "A.ARW.xmp", "A.xmp"]);
     }
 
     #[test]
