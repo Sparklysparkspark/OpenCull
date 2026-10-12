@@ -48,7 +48,7 @@ struct BoxAt {
 fn boxes(src: &dyn ReadAt, start: u64, end: u64) -> Vec<BoxAt> {
     let mut found = Vec::new();
     let mut pos = start;
-    while pos + 8 <= end && found.len() < 4096 {
+    while pos.checked_add(8).is_some_and(|p| p <= end) && found.len() < 4096 {
         let Some(head) = src.read_at(pos, 8) else { break };
         let mut size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as u64;
         let mut header = 8u64;
@@ -61,7 +61,8 @@ fn boxes(src: &dyn ReadAt, start: u64, end: u64) -> Vec<BoxAt> {
             // Runs to the end of whatever holds it.
             size = end - pos;
         }
-        if size < header || pos + size > end {
+        let Some(next) = pos.checked_add(size) else { break };
+        if size < header || next > end {
             break;
         }
         found.push(BoxAt {
@@ -69,13 +70,13 @@ fn boxes(src: &dyn ReadAt, start: u64, end: u64) -> Vec<BoxAt> {
             body: pos + header,
             len: size - header,
         });
-        pos += size;
+        pos = next;
     }
     found
 }
 
 fn child(src: &dyn ReadAt, parent: BoxAt, kind: &[u8; 4]) -> Option<BoxAt> {
-    boxes(src, parent.body, parent.body + parent.len).into_iter().find(|b| &b.kind == kind)
+    boxes(src, parent.body, parent.body.checked_add(parent.len)?).into_iter().find(|b| &b.kind == kind)
 }
 
 /// A JPEG beginning within the first bytes of `b`, running to its end. Canon
@@ -167,6 +168,25 @@ fn first_sample(src: &dyn ReadAt, trak: BoxAt) -> Option<(u64, u64)> {
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A CR3 holding nothing but Canon's metadata: `cmt1` as its camera
+    /// directory and `cmt2` as its exposure one, each a small TIFF.
+    pub fn cr3(cmt1: &[u8], cmt2: &[u8]) -> Vec<u8> {
+        let mut meta = super::CANON_META.to_vec();
+        meta.extend(bx(b"CMT1", cmt1));
+        meta.extend(bx(b"CMT2", cmt2));
+        [bx(b"ftyp", b"crx isom"), bx(b"moov", &bx(b"uuid", &meta))].concat()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -175,6 +195,17 @@ mod tests {
         out.extend_from_slice(kind);
         out.extend_from_slice(body);
         out
+    }
+
+    #[test]
+    fn a_box_claiming_a_size_past_the_end_of_numbers_is_refused() {
+        // size == 1: the real size follows in eight bytes, here the largest
+        // there is. Added to its position, it would wrap around.
+        let mut bytes = 1u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        assert!(boxes(&bytes.as_slice(), 0, bytes.len() as u64).is_empty());
     }
 
     fn full(version_and_rest: &[u8]) -> Vec<u8> {
