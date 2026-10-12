@@ -192,12 +192,23 @@ pub(crate) fn fresh(marks: Marks) -> String {
     )
 }
 
-/// Changes three values in an existing sidecar and nothing else.
+/// A regex built once from `pattern` and kept, since `update` runs on every
+/// rating change.
+fn cached(pattern: String) -> Regex {
+    static CACHE: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    cache.entry(pattern).or_insert_with_key(|p| Regex::new(p).expect("built pattern")).clone()
+}
+
+/// Changes the marks in an existing sidecar and nothing else.
 ///
 /// A sidecar written by Lightroom holds every develop setting for the photo.
 /// Rewriting the file from scratch to change a star rating would throw all of
-/// that away, so the existing text is edited in place.
+/// that away, so the existing text is edited in place. Only values that
+/// differ from what the sidecar already says are touched, so a label another
+/// program gave ("Approved") survives a change of rating.
 pub(crate) fn update(xml: &str, marks: Marks) -> String {
+    let before = parse(xml);
     let mut out = xml.to_string();
     // A value may only be written under a prefix the document has declared.
     // One Lightroom wrote declares both of these; one from a camera, or from
@@ -212,14 +223,14 @@ pub(crate) fn update(xml: &str, marks: Marks) -> String {
         }
     };
 
-    // The element form of each is removed first, so a value never ends up
-    // stated twice in two forms that then disagree.
-    for (ns, name) in [("xmp", "Rating"), ("xmp", "Label"), ("crs", "PickStatus")] {
-        let tag = format!("{ns}:{name}");
-        for pattern in [format!(r"\n?[ \t]*<{tag}>[^<]*</{tag}>"), format!(r"\n?[ \t]*<{tag}\s*/>")] {
-            out = Regex::new(&pattern).expect("built pattern").replace_all(&out, "").into_owned();
-        }
-    }
+    // Bridge rejects with a rating of -1. That has to be rewritten whenever
+    // the rating or the flag changes: as a pick status when the photo stays
+    // rejected, or cleared when it does not.
+    let bridge_reject = first_match(xml, &[r#"xmp:Rating="(-?\d+)""#, r"<xmp:Rating>(-?\d+)</xmp:Rating>"]).as_deref() == Some("-1");
+    let rating_differs = before.rating != marks.rating;
+    let flag_changed = before.flag != marks.flag || (bridge_reject && rating_differs && marks.flag == Flag::Reject);
+    let rating_changed = rating_differs || (bridge_reject && flag_changed);
+    let label_changed = before.color != marks.color;
 
     let pick = match marks.flag {
         Flag::Pick => Some("1".to_string()),
@@ -227,14 +238,23 @@ pub(crate) fn update(xml: &str, marks: Marks) -> String {
         Flag::None => None,
     };
     let values = [
-        ("xmp", "Rating", (marks.rating > 0).then(|| marks.rating.to_string())),
-        ("xmp", "Label", marks.color.label().map(str::to_string)),
-        ("crs", "PickStatus", pick),
+        (rating_changed, "xmp", "Rating", (marks.rating > 0).then(|| marks.rating.to_string())),
+        (label_changed, "xmp", "Label", marks.color.label().map(str::to_string)),
+        (flag_changed, "crs", "PickStatus", pick),
     ];
-    for (ns, name, value) in values {
-        let attribute = Regex::new(&format!(r#"{ns}:{name}="[^"]*""#)).expect("built pattern");
+    for (changed, ns, name, value) in values {
+        if !changed {
+            continue;
+        }
+        // The element form is removed first, so a value never ends up stated
+        // twice in two forms that then disagree.
+        let tag = format!("{ns}:{name}");
+        for pattern in [format!(r"\n?[ \t]*<{tag}>[^<]*</{tag}>"), format!(r"\n?[ \t]*<{tag}\s*/>")] {
+            out = cached(pattern).replace_all(&out, "").into_owned();
+        }
         match value {
             Some(v) => {
+                let attribute = cached(format!(r#"{ns}:{name}="[^"]*""#));
                 let replacement = format!(r#"{ns}:{name}="{v}""#);
                 declared(&mut out, ns, if ns == "xmp" { "http://ns.adobe.com/xap/1.0/" } else { "http://ns.adobe.com/camera-raw-settings/1.0/" });
                 if attribute.is_match(&out) {
@@ -244,10 +264,15 @@ pub(crate) fn update(xml: &str, marks: Marks) -> String {
                 }
             }
             None => {
-                let with_space = Regex::new(&format!(r#"\s*{ns}:{name}="[^"]*""#)).expect("built pattern");
-                out = with_space.replace_all(&out, "").into_owned();
+                out = cached(format!(r#"\s*{ns}:{name}="[^"]*""#)).replace_all(&out, "").into_owned();
             }
         }
+    }
+
+    // Photoshop's Urgency="1" also reads as a pick, so un-picking clears it.
+    if flag_changed && marks.flag != Flag::Pick {
+        out = cached(r#"\s*photoshop:Urgency="1""#.to_string()).replace_all(&out, "").into_owned();
+        out = cached(r"\n?[ \t]*<photoshop:Urgency>1</photoshop:Urgency>".to_string()).replace_all(&out, "").into_owned();
     }
     out
 }
@@ -257,9 +282,16 @@ pub(crate) fn update(xml: &str, marks: Marks) -> String {
 /// A photo with nothing marked and no sidecar gets none. An empty sidecar is
 /// not harmless: a reader prefers a sidecar and stops at it, so one that says
 /// nothing overrides a rating the camera embedded in the file.
+///
+/// A sidecar that exists but cannot be read is an error, never "no sidecar":
+/// writing a fresh one over it would throw away its develop settings.
 pub fn write(image: &Path, marks: Marks) -> std::io::Result<()> {
     let path = sidecar_path(image);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
     if existing.is_empty() && marks.is_empty() {
         return Ok(());
     }
@@ -440,6 +472,52 @@ mod tests {
         assert!(!text.contains("xmp:Label"), "a cleared label is removed, not left stale");
         assert_eq!(text.matches("xmp:Rating").count(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_read_is_never_written_over() {
+        let dir = scratch("unreadable");
+        let photo = dir.join("A7V00010.ARW");
+        // Not UTF-8, like a sidecar saved in another encoding.
+        let foreign = [0xFFu8, 0xFE, b'<', 0, b'x', 0];
+        std::fs::write(dir.join("A7V00010.xmp"), foreign).unwrap();
+
+        assert!(write(&photo, Marks { rating: 5, ..Default::default() }).is_err());
+        assert_eq!(std::fs::read(dir.join("A7V00010.xmp")).unwrap(), foreign);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_label_from_another_program_survives_a_change_of_rating() {
+        let bridge = LIGHTROOM.replace(r#"xmp:Label="Blue""#, r#"xmp:Label="Approved""#);
+        let changed = update(&bridge, Marks { rating: 5, ..Default::default() });
+        assert!(changed.contains(r#"xmp:Label="Approved""#), "{changed}");
+        assert!(changed.contains(r#"xmp:Rating="5""#));
+    }
+
+    #[test]
+    fn only_what_changed_is_touched() {
+        assert_eq!(update(LIGHTROOM, Marks { rating: 3, flag: Flag::None, color: Color::Blue }), LIGHTROOM);
+    }
+
+    #[test]
+    fn taking_away_a_pick_made_by_urgency_sticks() {
+        let urgent = LIGHTROOM.replace("   xmp:Rating=\"3\"", "   xmp:Rating=\"3\"\n   photoshop:Urgency=\"1\"");
+        assert_eq!(parse(&urgent).flag, Flag::Pick);
+        let cleared = update(&urgent, Marks { rating: 3, flag: Flag::None, color: Color::Blue });
+        assert_eq!(parse(&cleared).flag, Flag::None, "{cleared}");
+    }
+
+    #[test]
+    fn a_bridge_reject_survives_stars_and_can_be_taken_away() {
+        let rejected = LIGHTROOM.replace(r#"xmp:Rating="3""#, r#"xmp:Rating="-1""#);
+        assert_eq!(parse(&rejected).flag, Flag::Reject);
+
+        let starred = update(&rejected, Marks { rating: 2, flag: Flag::Reject, color: Color::Blue });
+        assert_eq!(parse(&starred), Marks { rating: 2, flag: Flag::Reject, color: Color::Blue }, "{starred}");
+
+        let cleared = update(&rejected, Marks { rating: 0, flag: Flag::None, color: Color::Blue });
+        assert_eq!(parse(&cleared).flag, Flag::None, "{cleared}");
     }
 
     #[test]
